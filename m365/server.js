@@ -69,7 +69,11 @@ function canRead(k,who){
   if(k==='audit')return ['Developer','Auditor'].includes(who.role);
   if(k==='userRoles')return who.role==='Developer';
   if(k==='payments')return ['Developer','Accounts','Auditor','Finance Reviewer'].includes(who.role);
-  return ['Developer','Auditor','Procurement Officer','Accounts','Finance Reviewer','Program Approver','Final Approver','Administration','Requester','Supplier Verification Officer'].includes(who.role);
+  if(k==='supplierApplications')return ['Developer','Auditor','Procurement Officer','Supplier Verification Officer','Finance Reviewer','Final Approver'].includes(who.role);
+  if(k==='approvals'||k==='delegations'||k==='authorityMatrix')return ['Developer','Auditor','Program Approver','Finance Reviewer','Final Approver'].includes(who.role);
+  if(k==='suppliers')return ['Developer','Auditor','Procurement Officer','Administration','Finance Reviewer','Final Approver'].includes(who.role);
+  if(k==='requests'||k==='documents')return ['Developer','Auditor','Procurement Officer','Accounts','Finance Reviewer','Program Approver','Final Approver','Administration','Requester'].includes(who.role);
+  return false;
 }
 const safeText=(v,max=255)=>String(v??'').trim().slice(0,max);
 const safePayload=(data)=>{
@@ -84,8 +88,9 @@ async function siteCheck(){
   if(url.hostname.toLowerCase()!==HOST || HOST.includes('-my.sharepoint.com') || /\/personal\//i.test(url.pathname)){
     throw Error('Refusing non-organizational SharePoint site');
   }
-  const d=await graph('/drives/'+encodeURIComponent(DRIVE));
-  if(d.driveType!=='documentLibrary'||!d.webUrl||new URL(d.webUrl).hostname.toLowerCase()!==HOST){
+  const siteDrives=await graphPages('/sites/'+site()+'/drives',200);
+  const d=siteDrives.find(x=>x.id===DRIVE);
+  if(!d||d.driveType!=='documentLibrary'||!d.webUrl||new URL(d.webUrl).hostname.toLowerCase()!==HOST){
     throw Error('M365_DOCUMENT_DRIVE_ID is not a library in the approved organization');
   }
 }
@@ -130,8 +135,12 @@ app.post('/api/m365/manual-payments',route(async(req,res)=>{
   const requestId=safeText(v.requestId,100), reference=safeText(v.reference,150);
   const method=safeText(v.method,50);
   const permitted=['Bank Transfer','Bank Deposit','Cash','Cheque','Other'];
-  if(!requestId||!reference||!permitted.includes(method)||!Number.isFinite(amount)||amount<=0)
-    throw err(400,'Request, payment reference, method and positive amount required');
+  const paymentDate=safeText(v.paymentDate,10);
+  const parsed=Date.parse(paymentDate+'T12:00:00Z');
+  if(!requestId||!reference||!permitted.includes(method)||!Number.isFinite(amount)||amount<=0||
+     !/^\d{4}-\d{2}-\d{2}$/.test(paymentDate)||!Number.isFinite(parsed)||parsed>Date.now()+86400000||
+     v.evidenceConfirmed!==true)
+    throw err(400,'Request, payment reference, actual payment date, evidence confirmation, method and positive amount required');
   const request=await findOne('requests',requestId);
   if(!request || !['Fully Approved','Partially Paid'].includes(request.Status))
     throw err(409,'Payment may be recorded only for an approved request');
@@ -142,7 +151,7 @@ app.post('/api/m365/manual-payments',route(async(req,res)=>{
   const id=randomUUID(), now=new Date().toISOString();
   await append('payments',{RecordId:id,Status:'Recorded',ActorId:who.id,UpdatedAt:now,
     RequestId:requestId,Amount:amount,Currency:request.Currency,Method:method,
-    Reference:reference,PaymentDate:now,Voided:false,Payload:safePayload({notes:safeText(v.notes,1000),
+    Reference:reference,PaymentDate:paymentDate+'T12:00:00Z',Voided:false,Payload:safePayload({notes:safeText(v.notes,1000),
       evidenceConfirmed:v.evidenceConfirmed===true})});
   await audit(who.id,'payments',id,'Manual payment recorded',{requestId,amount,method,reference});
   res.status(201).json({id,status:'Recorded',balance:Number(request.Amount)-paid-amount});
@@ -154,8 +163,7 @@ app.post('/api/m365/attachments',route(async(req,res)=>{
   if(!request)throw err(404,'Procurement request not found');
   if(!oversight.includes(who.role)&&request.RequesterId!==who.id)
     throw err(403,'Cannot upload to another requester record');
-  if(!['Draft','Returned for Correction'].includes(request.Status)&&
-      !['Developer','Procurement Officer'].includes(who.role))
+  if(!['Draft','Returned for Correction'].includes(request.Status))
     throw err(409,'Supporting documents are locked after submission');
   if(!/^[^/\\]+[.](pdf|docx|xlsx|png|jpg|jpeg|txt)$/i.test(filename))
     throw err(400,'Allowed formats: PDF, DOCX, XLSX, PNG, JPG, JPEG, TXT');
